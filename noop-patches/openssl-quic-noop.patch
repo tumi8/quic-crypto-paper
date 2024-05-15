@@ -1,0 +1,457 @@
+diff --git a/README.md b/README.md
+index d7abc52cb4..c82d259f12 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,20 @@
++Branch Specific Changes
++=======================
++
++This branch is based on OpenSSL 1.1.1w (quictls) and allows to **select the cipher suite used by TLS** by setting the `CIPHER_SUITE` environment variable.
++If the environment variable is unset, the cipher suite will be selected as usual.
++
++It also implements a **new TLS cipher suite** `TLS_NOOP_SHA256`, which uses an AEAD algorithm where plaintext equals ciphertext and which outputs a constant authentication tag (`0x2a2a2a...`).
++
++Possible values for the `CIPHER_SUITE` environment variable:
++
++| Cipher Suite Name              | Value for `CIPHER_SUITE`       |
++|--------------------------------|--------------------------------|
++| `TLS_AES_128_GCM_SHA256`       | `TLS_AES_128_GCM_SHA256`       |
++| `TLS_AES_256_GCM_SHA384`       | `TLS_AES_256_GCM_SHA384`       |
++| `TLS_CHACHA20_POLY1305_SHA256` | `TLS_CHACHA20_POLY1305_SHA256` |
++| `TLS_NOOP_SHA256`              | `TLS_NOOP_SHA256`              |
++
+ What This Is
+ ============
+ 
+diff --git a/crypto/evp/build.info b/crypto/evp/build.info
+index cc33ac3c49..386734cac6 100644
+--- a/crypto/evp/build.info
++++ b/crypto/evp/build.info
+@@ -12,7 +12,7 @@ SOURCE[../../libcrypto]=\
+         evp_pkey.c evp_pbe.c p5_crpt.c p5_crpt2.c pbe_scrypt.c \
+         e_old.c pmeth_lib.c pmeth_fn.c pmeth_gn.c m_sigver.c \
+         e_aes_cbc_hmac_sha1.c e_aes_cbc_hmac_sha256.c e_rc4_hmac_md5.c \
+-        e_chacha20_poly1305.c cmeth_lib.c
++        e_chacha20_poly1305.c cmeth_lib.c e_noop.c
+ 
+ INCLUDE[e_aes.o]=.. ../modes
+ INCLUDE[e_aes_cbc_hmac_sha1.o]=../modes
+diff --git a/crypto/evp/e_noop.c b/crypto/evp/e_noop.c
+new file mode 100644
+index 0000000000..c160eecc1a
+--- /dev/null
++++ b/crypto/evp/e_noop.c
+@@ -0,0 +1,236 @@
++#include "internal/cryptlib.h"
++#include <string.h>
++#include <openssl/evp.h>
++#include "evp_local.h"
++#include "crypto/evp.h"
++
++
++#define NOOP_KEYLEN 32
++#define NOOP_BLKLEN 1
++#define NOOP_IVLEN 12
++#define NOOP_MAX_IVLEN 12
++#define NOOP_TAGLEN 16
++
++
++typedef struct {
++    unsigned char tag[NOOP_TAGLEN];
++    unsigned char tls_aad[NOOP_TAGLEN];
++    int mac_inited, tag_len, nonce_len;
++    size_t tls_payload_length;
++} EVP_NOOP_AEAD_CTX;
++
++
++#define NO_TLS_PAYLOAD_LENGTH ((size_t)-1)
++#define aead_data(ctx)        ((EVP_NOOP_AEAD_CTX *)(ctx)->cipher_data)
++
++
++static int noop_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *inkey, const unsigned char *iv, int enc) {
++    EVP_NOOP_AEAD_CTX *actx = aead_data(ctx);
++
++    if (!inkey && !iv)
++        return 1;
++
++    actx->mac_inited = 0;
++    actx->tls_payload_length = NO_TLS_PAYLOAD_LENGTH;
++
++    return 1;
++}
++
++static int noop_tls_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
++                                        const unsigned char *in, size_t len)
++{
++    EVP_NOOP_AEAD_CTX *actx = aead_data(ctx);
++    size_t plen = actx->tls_payload_length;
++
++    if (len != plen + NOOP_TAGLEN)
++        return -1;
++
++    actx->tls_payload_length = NO_TLS_PAYLOAD_LENGTH;
++
++    if (in != out) {
++        memcpy(out, in, plen);
++    }
++
++    out += plen;
++
++    if (ctx->encrypt) {
++        memset(actx->tag, 42, NOOP_TAGLEN);
++        memcpy(out, actx->tag, NOOP_TAGLEN);
++    }
++
++    return len;
++}
++
++
++static int noop_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out, const unsigned char *in, size_t len) {
++    EVP_NOOP_AEAD_CTX *actx = aead_data(ctx);
++    size_t plen = actx->tls_payload_length;
++
++    if (!actx->mac_inited) {
++        if (plen != NO_TLS_PAYLOAD_LENGTH && out != NULL)
++            return noop_tls_cipher(ctx, out, in, len);
++
++        actx->mac_inited = 1;
++    }
++
++    if (in) { /* aad or text */
++        if (out == NULL) { /* aad */
++            return len;
++        } else { /* plain- or ciphertext */
++            actx->tls_payload_length = NO_TLS_PAYLOAD_LENGTH;
++            if (plen == NO_TLS_PAYLOAD_LENGTH)
++                plen = len;
++            else if (len != plen + NOOP_TAGLEN)
++                return -1;
++
++            if (in != out) {
++                memcpy(out, in, plen);
++            }
++            in += plen;
++            out += plen;
++        }
++    }
++    if (in == NULL                              /* explicit final */
++        || plen != len) {                       /* or tls mode */
++
++        if (ctx->encrypt) {
++            memset(actx->tag, 42, actx->tag_len);
++        }
++        actx->mac_inited = 0;
++
++        if (in != NULL && len != plen) {        /* tls mode */
++            if (ctx->encrypt) {
++                memcpy(out, actx->tag, NOOP_TAGLEN);
++            }
++        }
++    }
++    return len;
++}
++
++
++static int noop_cleanup(EVP_CIPHER_CTX *ctx) {
++    EVP_NOOP_AEAD_CTX *actx = aead_data(ctx);
++    if (actx)
++        OPENSSL_cleanse(ctx->cipher_data, sizeof(*actx));
++    return 1;
++}
++
++
++static int noop_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg, void *ptr) {
++    EVP_NOOP_AEAD_CTX *actx = aead_data(ctx);
++
++    switch(type) {
++        case EVP_CTRL_INIT:
++            if (actx == NULL)
++                actx = ctx->cipher_data = OPENSSL_zalloc(sizeof(*actx));
++            if (actx == NULL) {
++                EVPerr(EVP_F_CHACHA20_POLY1305_CTRL, EVP_R_INITIALIZATION_ERROR);
++                return 0;
++            }
++            actx->mac_inited = 0;
++            actx->tag_len = 0;
++            actx->nonce_len = NOOP_IVLEN;
++            actx->tls_payload_length = NO_TLS_PAYLOAD_LENGTH;
++            memset(actx->tls_aad, 0, NOOP_TAGLEN);
++            return 1;
++
++        case EVP_CTRL_COPY:
++            if (actx) {
++                EVP_CIPHER_CTX *dst = (EVP_CIPHER_CTX *)ptr;
++
++                dst->cipher_data =
++                    OPENSSL_memdup(actx, sizeof(*actx));
++                if (dst->cipher_data == NULL) {
++                    EVPerr(EVP_F_CHACHA20_POLY1305_CTRL, EVP_R_COPY_ERROR);
++                    return 0;
++                }
++            }
++            return 1;
++
++        case EVP_CTRL_GET_IVLEN:
++            *(int *)ptr = actx->nonce_len;
++            return 1;
++
++        case EVP_CTRL_AEAD_SET_IVLEN:
++            if (arg <= 0 || arg > NOOP_MAX_IVLEN)
++                return 0;
++            actx->nonce_len = arg;
++            return 1;
++
++        case EVP_CTRL_AEAD_SET_IV_FIXED:
++            if (arg != NOOP_IVLEN)
++                return 0;
++            return 1;
++
++        case EVP_CTRL_AEAD_SET_TAG:
++            if (arg <= 0 || arg > NOOP_TAGLEN)
++                return 0;
++            if (ptr != NULL) {
++                memcpy(actx->tag, ptr, arg);
++                actx->tag_len = arg;
++            }
++            return 1;
++
++        case EVP_CTRL_AEAD_GET_TAG:
++            if (arg <= 0 || arg > NOOP_TAGLEN || !ctx->encrypt)
++                return 0;
++            memcpy(ptr, actx->tag, arg);
++            return 1;
++
++        case EVP_CTRL_AEAD_TLS1_AAD:
++            if (arg != EVP_AEAD_TLS1_AAD_LEN)
++                return 0;
++            {
++                unsigned int len;
++                unsigned char *aad = ptr;
++
++                memcpy(actx->tls_aad, ptr, EVP_AEAD_TLS1_AAD_LEN);
++                len = aad[EVP_AEAD_TLS1_AAD_LEN - 2] << 8 | aad[EVP_AEAD_TLS1_AAD_LEN - 1];
++                aad = actx->tls_aad;
++                if (!ctx->encrypt) {
++                    if (len < NOOP_TAGLEN)
++                        return 0;
++                    len -= NOOP_TAGLEN;     /* discount attached tag */
++                    aad[EVP_AEAD_TLS1_AAD_LEN - 2] = (unsigned char)(len >> 8);
++                    aad[EVP_AEAD_TLS1_AAD_LEN - 1] = (unsigned char)len;
++                }
++                actx->tls_payload_length = len;
++
++                actx->mac_inited = 0;
++
++                return NOOP_TAGLEN;         /* tag length */
++            }
++
++        case EVP_CTRL_AEAD_SET_MAC_KEY:
++            /* no-op */
++            return 1;
++
++        default:
++            return -1;
++
++    }
++}
++
++
++static const EVP_CIPHER aead_noop = {
++        42424242,
++        NOOP_BLKLEN,     /* block_size */
++        NOOP_KEYLEN,     /* key_len */
++        NOOP_IVLEN,      /* iv_len */
++        EVP_CIPH_FLAG_AEAD_CIPHER | EVP_CIPH_CUSTOM_IV |
++        EVP_CIPH_ALWAYS_CALL_INIT | EVP_CIPH_CTRL_INIT |
++        EVP_CIPH_CUSTOM_COPY | EVP_CIPH_FLAG_CUSTOM_CIPHER |
++        EVP_CIPH_CUSTOM_IV_LENGTH,
++        noop_init_key,
++        noop_cipher,
++        noop_cleanup,
++        0,          /* 0 moves context-specific structure allocation to ctrl */
++        NULL,       /* set_asn1_parameters */
++        NULL,       /* get_asn1_parameters */
++        noop_ctrl,
++        NULL        /* app_data */
++};
++
++const EVP_CIPHER *EVP_noop(void) {
++    return &aead_noop;
++}
+diff --git a/include/openssl/evp.h b/include/openssl/evp.h
+index 275b7a4acc..25dec5348e 100644
+--- a/include/openssl/evp.h
++++ b/include/openssl/evp.h
+@@ -393,6 +393,9 @@ typedef struct {
+ /* Length of tag for TLS */
+ # define EVP_CHACHAPOLY_TLS_TAG_LEN                      16
+ 
++/* Length of tag for TLS */
++# define EVP_NOOP_TLS_TAG_LEN                            16
++
+ typedef struct evp_cipher_info_st {
+     const EVP_CIPHER *cipher;
+     unsigned char iv[EVP_MAX_IV_LENGTH];
+@@ -921,6 +924,7 @@ const EVP_CIPHER *EVP_chacha20(void);
+ const EVP_CIPHER *EVP_chacha20_poly1305(void);
+ #  endif
+ # endif
++const EVP_CIPHER *EVP_noop(void);
+ 
+ # ifndef OPENSSL_NO_SEED
+ const EVP_CIPHER *EVP_seed_ecb(void);
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 63ee3baae7..ef985e6775 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -175,10 +175,12 @@ extern "C" {
+ # if !defined(OPENSSL_NO_CHACHA) && !defined(OPENSSL_NO_POLY1305)
+ #  define TLS_DEFAULT_CIPHERSUITES "TLS_AES_256_GCM_SHA384:" \
+                                    "TLS_CHACHA20_POLY1305_SHA256:" \
+-                                   "TLS_AES_128_GCM_SHA256"
++                                   "TLS_AES_128_GCM_SHA256:" \
++                                   "TLS_NOOP_SHA256"
+ # else
+ #  define TLS_DEFAULT_CIPHERSUITES "TLS_AES_256_GCM_SHA384:" \
+-                                   "TLS_AES_128_GCM_SHA256"
++                                   "TLS_AES_128_GCM_SHA256:" \
++                                   "TLS_NOOP_SHA256"
+ #endif
+ /*
+  * As of OpenSSL 1.0.0, ssl_create_cipher_list() in ssl/ssl_ciph.c always
+diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
+index 2cbf53265f..2c4ed301db 100644
+--- a/include/openssl/tls1.h
++++ b/include/openssl/tls1.h
+@@ -616,6 +616,7 @@ __owur int SSL_check_chain(SSL *s, X509 *x, EVP_PKEY *pk, STACK_OF(X509) *chain)
+ # define TLS1_3_CK_CHACHA20_POLY1305_SHA256               0x03001303
+ # define TLS1_3_CK_AES_128_CCM_SHA256                     0x03001304
+ # define TLS1_3_CK_AES_128_CCM_8_SHA256                   0x03001305
++# define TLS1_3_CK_NOOP_SHA256                            0x03004242
+ 
+ /* Aria ciphersuites from RFC6209 */
+ # define TLS1_CK_RSA_WITH_ARIA_128_GCM_SHA256             0x0300C050
+diff --git a/ssl/record/ssl3_record_tls13.c b/ssl/record/ssl3_record_tls13.c
+index ab50e37624..252fe06650 100644
+--- a/ssl/record/ssl3_record_tls13.c
++++ b/ssl/record/ssl3_record_tls13.c
+@@ -107,6 +107,8 @@ int tls13_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int sending)
+         taglen = EVP_GCM_TLS_TAG_LEN;
+     } else if (alg_enc & SSL_CHACHA20) {
+         taglen = EVP_CHACHAPOLY_TLS_TAG_LEN;
++    } else if (alg_enc & SSL_NOOP) {
++        taglen = EVP_NOOP_TLS_TAG_LEN;
+     } else {
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLS13_ENC,
+                  ERR_R_INTERNAL_ERROR);
+diff --git a/ssl/s3_lib.c b/ssl/s3_lib.c
+index 32f9b25710..bc67e82af7 100644
+--- a/ssl/s3_lib.c
++++ b/ssl/s3_lib.c
+@@ -111,6 +111,21 @@ static SSL_CIPHER tls13_ciphers[] = {
+         SSL_HANDSHAKE_MAC_SHA256,
+         128,
+         128,
++    }, {
++        1,
++        "TLS_NOOP_SHA256",
++        "TLS_NOOP_SHA256",
++        TLS1_3_CK_NOOP_SHA256,
++        SSL_kANY,
++        SSL_aANY,
++        SSL_NOOP,
++        SSL_AEAD,
++        TLS1_3_VERSION, TLS1_3_VERSION,
++        0, 0,
++        SSL_HIGH,
++        SSL_HANDSHAKE_MAC_SHA256,
++        256,
++        256,
+     }
+ };
+ 
+diff --git a/ssl/ssl_ciph.c b/ssl/ssl_ciph.c
+index bc26aad7bb..eee7db03aa 100644
+--- a/ssl/ssl_ciph.c
++++ b/ssl/ssl_ciph.c
+@@ -43,7 +43,8 @@
+ #define SSL_ENC_CHACHA_IDX      19
+ #define SSL_ENC_ARIA128GCM_IDX  20
+ #define SSL_ENC_ARIA256GCM_IDX  21
+-#define SSL_ENC_NUM_IDX         22
++#define SSL_ENC_NOOP_IDX        22
++#define SSL_ENC_NUM_IDX         23
+ 
+ /* NB: make sure indices in these tables match values above */
+ 
+@@ -76,6 +77,7 @@ static const ssl_cipher_table ssl_cipher_table_cipher[SSL_ENC_NUM_IDX] = {
+     {SSL_CHACHA20POLY1305, NID_chacha20_poly1305}, /* SSL_ENC_CHACHA_IDX 19 */
+     {SSL_ARIA128GCM, NID_aria_128_gcm}, /* SSL_ENC_ARIA128GCM_IDX 20 */
+     {SSL_ARIA256GCM, NID_aria_256_gcm}, /* SSL_ENC_ARIA256GCM_IDX 21 */
++    {SSL_NOOP, 42424242}, /* SSL_ENC_NOOP_IDX 22 */
+ };
+ 
+ static const EVP_CIPHER *ssl_cipher_methods[SSL_ENC_NUM_IDX];
+@@ -365,7 +367,12 @@ int ssl_load_ciphers(void)
+         if (t->nid == NID_undef) {
+             ssl_cipher_methods[i] = NULL;
+         } else {
+-            const EVP_CIPHER *cipher = EVP_get_cipherbynid(t->nid);
++            const EVP_CIPHER *cipher;
++            if (t->mask == SSL_NOOP) {
++                cipher = EVP_noop();
++            } else {
++                cipher = EVP_get_cipherbynid(t->nid);
++            }
+             ssl_cipher_methods[i] = cipher;
+             if (cipher == NULL)
+                 disabled_enc_mask |= t->mask;
+@@ -1791,6 +1798,9 @@ char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf, int len)
+     case SSL_CHACHA20POLY1305:
+         enc = "CHACHA20/POLY1305(256)";
+         break;
++    case SSL_NOOP:
++        enc = "NOOP";
++        break;
+     default:
+         enc = "unknown";
+         break;
+@@ -2117,6 +2127,8 @@ int ssl_cipher_get_overhead(const SSL_CIPHER *c, size_t *mac_overhead,
+         out = EVP_CCM_TLS_EXPLICIT_IV_LEN + 8;
+     } else if (c->algorithm_enc & SSL_CHACHA20POLY1305) {
+         out = 16;
++    } else if (c->algorithm_enc & SSL_NOOP) {
++        out = 16;
+     } else if (c->algorithm_mac & SSL_AEAD) {
+         /* We're supposed to have handled all the AEAD modes above */
+         return 0;
+diff --git a/ssl/ssl_local.h b/ssl/ssl_local.h
+index 91e0fd78c5..a2f74bb274 100644
+--- a/ssl/ssl_local.h
++++ b/ssl/ssl_local.h
+@@ -230,6 +230,7 @@
+ # define SSL_CHACHA20POLY1305    0x00080000U
+ # define SSL_ARIA128GCM          0x00100000U
+ # define SSL_ARIA256GCM          0x00200000U
++# define SSL_NOOP                0x00400000U
+ 
+ # define SSL_AESGCM              (SSL_AES128GCM | SSL_AES256GCM)
+ # define SSL_AESCCM              (SSL_AES128CCM | SSL_AES256CCM | SSL_AES128CCM8 | SSL_AES256CCM8)
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index c8b9097180..60d90b8ab2 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -1253,6 +1253,13 @@ int tls_construct_client_hello(SSL *s, WPACKET *pkt)
+         return 0;
+     }
+ 
++    const char* ciphersuite_name = getenv("CIPHER_SUITE");
++    if (ciphersuite_name != NULL) {
++        if (SSL_set_ciphersuites(s, ciphersuite_name) == 0) {
++            return 0;
++        }
++    }
++
+     if (!ssl_cipher_list_to_bytes(s, SSL_get_ciphers(s), pkt)) {
+         /* SSLfatal() already called */
+         return 0;

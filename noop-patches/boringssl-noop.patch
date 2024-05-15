@@ -1,0 +1,351 @@
+diff --git a/README.md b/README.md
+index d3d5e29d6..2f69530ca 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,19 @@
++# Branch Specific Changes
++
++This branch allows to **select the cipher suite used by TLS** by setting the `CIPHER_SUITE` environment variable.
++If the environment variable is unset, the cipher suite will be selected as usual.
++
++It also implements a **new TLS cipher suite** `TLS_NOOP_SHA256`, which uses an AEAD algorithm where plaintext equals ciphertext and which outputs a constant authentication tag (`0x2a2a2a...`).
++
++Possible values for the `CIPHER_SUITE` environment variable:
++
++| Cipher Suite Name              | Value for `CIPHER_SUITE` |
++|--------------------------------|--------------------------|
++| `TLS_AES_128_GCM_SHA256`       | `0x03001301`             |
++| `TLS_AES_256_GCM_SHA384`       | `0x03001302`             |
++| `TLS_CHACHA20_POLY1305_SHA256` | `0x03001303`             |
++| `TLS_NOOP_SHA256`              | `0x03004242`             |
++
+ # BoringSSL
+ 
+ BoringSSL is a fork of OpenSSL that is designed to meet Google's needs.
+diff --git a/crypto/CMakeLists.txt b/crypto/CMakeLists.txt
+index cdb5ddca1..062d34c51 100644
+--- a/crypto/CMakeLists.txt
++++ b/crypto/CMakeLists.txt
+@@ -118,6 +118,7 @@ add_library(
+   cipher_extra/e_aesgcmsiv.c
+   cipher_extra/e_chacha20poly1305.c
+   cipher_extra/e_des.c
++  cipher_extra/e_noop.c
+   cipher_extra/e_null.c
+   cipher_extra/e_rc2.c
+   cipher_extra/e_rc4.c
+diff --git a/crypto/cipher_extra/aead_test.cc b/crypto/cipher_extra/aead_test.cc
+index a8d2dbd8c..1f8560bcc 100644
+--- a/crypto/cipher_extra/aead_test.cc
++++ b/crypto/cipher_extra/aead_test.cc
+@@ -152,6 +152,8 @@ static const struct KnownAEAD kAEADs[] = {
+ 
+     {"AES_128_CCM_Matter", EVP_aead_aes_128_ccm_matter,
+      "aes_128_ccm_matter_tests.txt", 0},
++
++    {"NOOP", EVP_aead_noop, "noop_tests.txt", 0},
+ };
+ 
+ class PerAEADTest : public testing::TestWithParam<KnownAEAD> {
+diff --git a/crypto/cipher_extra/e_noop.c b/crypto/cipher_extra/e_noop.c
+new file mode 100644
+index 000000000..79317b213
+--- /dev/null
++++ b/crypto/cipher_extra/e_noop.c
+@@ -0,0 +1,122 @@
++#include <openssl/aead.h>
++#include <openssl/cipher.h>
++#include <openssl/err.h>
++#include <openssl/mem.h>
++
++#include "../fipsmodule/cipher/internal.h"
++#include "../internal.h"
++
++// These values work for ChaCha20-Poly1305, so they should work for our cipher
++#define EVP_AEAD_NOOP_TAG_LEN 16
++#define EVP_AEAD_NOOP_NONCE_LEN 12
++
++static int aead_noop_init(EVP_AEAD_CTX *ctx, const uint8_t *key, size_t key_len,
++                          size_t tag_len) {
++  if (tag_len > EVP_AEAD_NOOP_TAG_LEN) {
++    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_TAG_TOO_LARGE);
++    return 0;
++  }
++  ctx->tag_len = EVP_AEAD_NOOP_TAG_LEN;
++  return 1;
++}
++
++static void aead_noop_cleanup(EVP_AEAD_CTX *ctx) {}
++
++static int aead_noop_seal_scatter(const EVP_AEAD_CTX *ctx, uint8_t *out,
++                                  uint8_t *out_tag, size_t *out_tag_len,
++                                  size_t max_out_tag_len, const uint8_t *nonce,
++                                  size_t nonce_len, const uint8_t *in,
++                                  size_t in_len, const uint8_t *extra_in,
++                                  size_t extra_in_len, const uint8_t *ad,
++                                  size_t ad_len) {
++  size_t tag_len = ctx->tag_len;
++
++  if (extra_in_len + tag_len < tag_len) {
++    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_TOO_LARGE);
++    return 0;
++  }
++
++  // max_out_tag_len must be sized to allow for the additional extra_in_len
++  // bytes.
++  if (max_out_tag_len < tag_len + extra_in_len) {
++    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BUFFER_TOO_SMALL);
++    return 0;
++  }
++
++  if (nonce_len != EVP_AEAD_NOOP_NONCE_LEN) {
++    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_UNSUPPORTED_NONCE_SIZE);
++    return 0;
++  }
++
++  if (extra_in_len) {
++    // extra_in may point to an additional plaintext input buffer if the cipher
++    // supports it. If present, extra_in_len additional bytes of plaintext are
++    // encrypted and authenticated, and the ciphertext is written (before the
++    // tag) to out_tag.
++    OPENSSL_memcpy(out_tag, extra_in, extra_in_len);
++  }
++
++  // Encrypts and authenticates in_len bytes from in and authenticates ad_len
++  // bytes from ad. It writes in_len bytes of ciphertext to out and the
++  // authentication tag to out_tag. Exactly in_len bytes are written to out, and
++  // up to EVP_AEAD_max_overhead+extra_in_len bytes to out_tag.
++  if (in != out) {
++    OPENSSL_memcpy(out, in, in_len);
++  }
++  OPENSSL_memset(out_tag + extra_in_len, 42, tag_len);
++
++  // On successful return, *out_tag_len is set to the actual number of bytes
++  // written to out_tag.
++  *out_tag_len = tag_len + extra_in_len;
++
++  // It returns one on success and zero otherwise.
++  return 1;
++}
++
++static int aead_noop_open_gather(const EVP_AEAD_CTX *ctx, uint8_t *out,
++                                 const uint8_t *nonce, size_t nonce_len,
++                                 const uint8_t *in, size_t in_len,
++                                 const uint8_t *in_tag, size_t in_tag_len,
++                                 const uint8_t *ad, size_t ad_len) {
++  // The length of nonce, nonce_len, must be equal to the result of
++  // EVP_AEAD_nonce_length for this AEAD.
++  if (nonce_len != EVP_AEAD_NOOP_NONCE_LEN) {
++    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_UNSUPPORTED_NONCE_SIZE);
++    return 0;
++  }
++
++  if (in_tag_len != ctx->tag_len) {
++    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BAD_DECRYPT);
++    return 0;
++  }
++
++  // Decrypts and authenticates in_len bytes from in and authenticates ad_len
++  // bytes from ad using in_tag_len bytes of authentication tag from in_tag.
++  // If successful, it writes in_len bytes of plaintext to out.
++  if (in != out) {
++    OPENSSL_memcpy(out, in, in_len);
++  }
++
++  // It returns one on success and zero otherwise.
++  return 1;
++}
++
++static const EVP_AEAD aead_noop = {
++    32,                       // key len (same as ChaCha20-Poly1305)
++    EVP_AEAD_NOOP_NONCE_LEN,  // nonce len
++    EVP_AEAD_NOOP_TAG_LEN,    // overhead: maximum number of additional bytes
++                              // added by the act of sealing data
++    EVP_AEAD_NOOP_TAG_LEN,    // max tag length
++    1,                        // seal_scatter_supports_extra_in
++
++    aead_noop_init,
++    NULL,  // init_with_direction
++    aead_noop_cleanup,
++    NULL,  // open
++    aead_noop_seal_scatter,
++    aead_noop_open_gather,
++    NULL,  // get_iv
++    NULL,  // tag_len
++};
++
++const EVP_AEAD *EVP_aead_noop(void) { return &aead_noop; }
+diff --git a/crypto/cipher_extra/test/noop_tests.txt b/crypto/cipher_extra/test/noop_tests.txt
+new file mode 100644
+index 000000000..48d45376d
+--- /dev/null
++++ b/crypto/cipher_extra/test/noop_tests.txt
+@@ -0,0 +1,6 @@
++KEY: 808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f
++NONCE: 070000004041424344454647
++IN: "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
++AD: 50515253c0c1c2c3c4c5c6c7
++CT: 4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e
++TAG: 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a
+diff --git a/include/openssl/aead.h b/include/openssl/aead.h
+index 376bff17a..d628965b9 100644
+--- a/include/openssl/aead.h
++++ b/include/openssl/aead.h
+@@ -182,6 +182,8 @@ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_128_ccm_bluetooth_8(void);
+ // and 13-byte nonces), as used in the Matter specification.
+ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_128_ccm_matter(void);
+ 
++OPENSSL_EXPORT const EVP_AEAD *EVP_aead_noop(void);
++
+ // EVP_has_aes_hardware returns one if we enable hardware support for fast and
+ // constant-time AES-GCM.
+ OPENSSL_EXPORT int EVP_has_aes_hardware(void);
+diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
+index 772fb87a3..abeeedf6f 100644
+--- a/include/openssl/tls1.h
++++ b/include/openssl/tls1.h
+@@ -457,6 +457,7 @@ extern "C" {
+ #define TLS1_3_CK_AES_128_GCM_SHA256 0x03001301
+ #define TLS1_3_CK_AES_256_GCM_SHA384 0x03001302
+ #define TLS1_3_CK_CHACHA20_POLY1305_SHA256 0x03001303
++#define TLS1_3_CK_NOOP_SHA256 0x03004242
+ 
+ // The following constants are legacy aliases of |TLS1_3_CK_*|.
+ // TODO(davidben): Migrate callers to the new name and remove these.
+diff --git a/sources.cmake b/sources.cmake
+index 5c7e881bf..78415cd1b 100644
+--- a/sources.cmake
++++ b/sources.cmake
+@@ -28,6 +28,7 @@ set(
+   crypto/cipher_extra/test/cipher_tests.txt
+   crypto/cipher_extra/test/des_ede3_cbc_sha1_tls_implicit_iv_tests.txt
+   crypto/cipher_extra/test/des_ede3_cbc_sha1_tls_tests.txt
++  crypto/cipher_extra/test/noop_tests.txt
+   crypto/cipher_extra/test/nist_cavp/aes_128_cbc.txt
+   crypto/cipher_extra/test/nist_cavp/aes_128_ctr.txt
+   crypto/cipher_extra/test/nist_cavp/aes_128_gcm.txt
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 971ebd0b1..6a644e40f 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -243,23 +243,31 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+   // Add TLS 1.3 ciphers. Order ChaCha20-Poly1305 relative to AES-GCM based on
+   // hardware support.
+   if (hs->max_version >= TLS1_3_VERSION) {
+-    const bool has_aes_hw = ssl->config->aes_hw_override
+-                                ? ssl->config->aes_hw_override_value
+-                                : EVP_has_aes_hardware();
+-
+-    if ((!has_aes_hw &&  //
+-         !ssl_add_tls13_cipher(&child,
+-                               TLS1_3_CK_CHACHA20_POLY1305_SHA256 & 0xffff,
+-                               ssl->config->tls13_cipher_policy)) ||
+-        !ssl_add_tls13_cipher(&child, TLS1_3_CK_AES_128_GCM_SHA256 & 0xffff,
+-                              ssl->config->tls13_cipher_policy) ||
+-        !ssl_add_tls13_cipher(&child, TLS1_3_CK_AES_256_GCM_SHA384 & 0xffff,
+-                              ssl->config->tls13_cipher_policy) ||
+-        (has_aes_hw &&  //
+-         !ssl_add_tls13_cipher(&child,
+-                               TLS1_3_CK_CHACHA20_POLY1305_SHA256 & 0xffff,
+-                               ssl->config->tls13_cipher_policy))) {
+-      return false;
++    if (const char* cipher = std::getenv("CIPHER_SUITE")) {
++      uint16_t cipher_id = static_cast<uint16_t>(std::strtoul(cipher, nullptr, 0));
++      if (!ssl_add_tls13_cipher(&child, cipher_id & 0xffff,
++                                ssl->config->tls13_cipher_policy)) {
++        return false;
++      }
++    } else {
++      const bool has_aes_hw = ssl->config->aes_hw_override
++                                  ? ssl->config->aes_hw_override_value
++                                  : EVP_has_aes_hardware();
++
++      if ((!has_aes_hw &&  //
++           !ssl_add_tls13_cipher(&child,
++                                 TLS1_3_CK_CHACHA20_POLY1305_SHA256 & 0xffff,
++                                 ssl->config->tls13_cipher_policy)) ||
++          !ssl_add_tls13_cipher(&child, TLS1_3_CK_AES_128_GCM_SHA256 & 0xffff,
++                                ssl->config->tls13_cipher_policy) ||
++          !ssl_add_tls13_cipher(&child, TLS1_3_CK_AES_256_GCM_SHA384 & 0xffff,
++                                ssl->config->tls13_cipher_policy) ||
++          (has_aes_hw &&  //
++           !ssl_add_tls13_cipher(&child,
++                                 TLS1_3_CK_CHACHA20_POLY1305_SHA256 & 0xffff,
++                                 ssl->config->tls13_cipher_policy))) {
++        return false;
++      }
+     }
+   }
+ 
+diff --git a/ssl/internal.h b/ssl/internal.h
+index 1e6da2153..aa56ab79f 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -548,6 +548,7 @@ BSSL_NAMESPACE_BEGIN
+ #define SSL_AES128GCM 0x00000008u
+ #define SSL_AES256GCM 0x00000010u
+ #define SSL_CHACHA20POLY1305 0x00000020u
++#define SSL_NOOP 0x00000040u
+ 
+ #define SSL_AES (SSL_AES128 | SSL_AES256 | SSL_AES128GCM | SSL_AES256GCM)
+ 
+diff --git a/ssl/ssl_cipher.cc b/ssl/ssl_cipher.cc
+index ebb075351..e5f10cdb3 100644
+--- a/ssl/ssl_cipher.cc
++++ b/ssl/ssl_cipher.cc
+@@ -287,6 +287,18 @@ static constexpr SSL_CIPHER kCiphers[] = {
+       SSL_HANDSHAKE_MAC_SHA256,
+     },
+ 
++    // NOOP Cipher
++    {
++      "TLS_NOOP_SHA256", // OpenSSL name for the cipher
++      "TLS_NOOP_SHA256", // IETF name for the cipher
++      TLS1_3_CK_NOOP_SHA256, // id
++      SSL_kGENERIC, // algorithm_mkey
++      SSL_aGENERIC, // algorithm_auth
++      SSL_NOOP, // algorithm_enc
++      SSL_AEAD, // algorithm_mac
++      SSL_HANDSHAKE_MAC_SHA256, // algorithm_prf
++    },
++
+     // Cipher C009
+     {
+      TLS1_TXT_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+@@ -546,6 +558,7 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+     {"AES", ~0u, ~0u, SSL_AES, ~0u, 0},
+     {"AESGCM", ~0u, ~0u, SSL_AES128GCM | SSL_AES256GCM, ~0u, 0},
+     {"CHACHA20", ~0u, ~0u, SSL_CHACHA20POLY1305, ~0u, 0},
++    {"NOOP", ~0u, ~0u, SSL_NOOP, ~0u, 0},
+ 
+     // MAC aliases
+     {"SHA1", ~0u, ~0u, ~0u, SSL_SHA1, 0},
+@@ -602,6 +615,9 @@ bool ssl_cipher_get_evp_aead(const EVP_AEAD **out_aead,
+     } else if (cipher->algorithm_enc == SSL_CHACHA20POLY1305) {
+       *out_aead = EVP_aead_chacha20_poly1305();
+       *out_fixed_iv_len = 12;
++    } else if (cipher->algorithm_enc == SSL_NOOP) {
++      *out_aead = EVP_aead_noop();
++      *out_fixed_iv_len = 12;
+     } else {
+       return false;
+     }
+@@ -1542,6 +1558,7 @@ int SSL_CIPHER_get_bits(const SSL_CIPHER *cipher, int *out_alg_bits) {
+     case SSL_AES256:
+     case SSL_AES256GCM:
+     case SSL_CHACHA20POLY1305:
++    case SSL_NOOP:
+       alg_bits = 256;
+       strength_bits = 256;
+       break;
+@@ -1641,6 +1658,10 @@ const char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf,
+       enc = "ChaCha20-Poly1305";
+       break;
+ 
++    case SSL_NOOP:
++      enc = "NOOP";
++      break;
++
+     default:
+       enc = "unknown";
+       break;
